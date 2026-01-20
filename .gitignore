@@ -1,0 +1,44 @@
+# Secrets - DO NOT COMMIT
+vertex-key.json
+*.json
+!package.json
+!requirements.json
+
+# API Keys
+*_KEYS.txt
+*_TOKEN.txt
+*API_KEY*
+
+# Environment variables
+.env
+.env.local
+env-settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Azure
+*.publishsettings
+publish-profile.xml
+*.zip
+
+# Local HTML files
+*.html
+
+# Old app.py
+app.py
