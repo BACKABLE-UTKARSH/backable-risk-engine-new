@@ -20,7 +20,7 @@ import io
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
-from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -28,6 +28,9 @@ from azure.storage.blob import BlobServiceClient, ContainerClient, ContentSettin
 import psycopg2
 import uvicorn
 import base64
+import jwt
+import hashlib
+from psycopg2.extras import RealDictCursor
 from dataclasses import dataclass
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9154,6 +9157,143 @@ COMPREHENSIVE OPTIMIZATION USING ALL 7 ENGINE INTELLIGENCE:
     }
 
 # ======================================================
+#           JWT Authentication Configuration
+# ======================================================
+
+# JWT Secret Key - must match the key used by philotimo-backend
+JWT_SECRET = os.getenv("JWT_SECRET", "philotimo-global-jwt-secret-2024!!")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+
+# Philotimo database configuration for token validation
+PHILOTIMO_DB_CONFIG = {
+    "host": "philotimo-staging-db.postgres.database.azure.com",
+    "database": "philotimodb",
+    "user": "wchen",
+    "password": "DevPhilot2024!!",
+    "port": 5432,
+    "sslmode": "require"
+}
+
+def hash_token(token: str) -> str:
+    """Hash a JWT token using SHA256 for database comparison"""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+async def verify_jwt_token(authorization: str = Header(None)) -> Dict:
+    """
+    Verify JWT token from Authorization header and validate against database
+
+    Args:
+        authorization: Authorization header containing Bearer token
+
+    Returns:
+        Dict containing user_id, client_id, and email
+
+    Raises:
+        HTTPException: If token is missing, invalid, or expired
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization header"
+        )
+
+    # Extract token from "Bearer <token>" format
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format. Expected 'Bearer <token>'"
+        )
+
+    token = parts[1]
+
+    try:
+        # Decode JWT to get JTI (JWT ID)
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        jti = payload.get("jti")
+        user_id_from_sub = payload.get("sub")  # Some tokens use 'sub' for user_id
+
+        if not jti:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token: Missing JTI"
+            )
+
+        # Hash the token for database lookup
+        token_hash = hash_token(token)
+
+        # Validate token against database
+        conn = None
+        try:
+            conn = psycopg2.connect(**PHILOTIMO_DB_CONFIG)
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+            # Query to validate token and get user info
+            query = """
+                SELECT
+                    t.user_id,
+                    t.is_revoked AS revoked,
+                    t.expires_at,
+                    u.client_id,
+                    u.email
+                FROM api_tokens t
+                JOIN users u ON t.user_id = u.id
+                WHERE t.jti = %s AND t.token_hash = %s
+            """
+
+            cursor.execute(query, (jti, token_hash))
+            result = cursor.fetchone()
+
+            if not result:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid token: Token not found in database"
+                )
+
+            # Check if token is revoked
+            if result['revoked']:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid token: Token has been revoked"
+                )
+
+            # Check if token is expired
+            if result['expires_at']:
+                import datetime
+                if datetime.datetime.now(datetime.timezone.utc) > result['expires_at']:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Invalid token: Token has expired"
+                    )
+
+            return {
+                "user_id": result['user_id'],
+                "client_id": result['client_id'],
+                "email": result['email']
+            }
+
+        finally:
+            if conn:
+                conn.close()
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token: Token has expired"
+        )
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {str(e)}"
+        )
+    except Exception as e:
+        logging.error(f"Token validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Token validation failed: {str(e)}"
+        )
+
+# ======================================================
 #           FastAPI Application Setup
 # ======================================================
 
@@ -9507,6 +9647,20 @@ async def root():
         "api_keys_status": get_enhanced_api_key_status()
     }
 
+@app.get("/auth/me")
+async def get_authenticated_user(auth: Dict = Depends(verify_jwt_token)):
+    """
+    Get authenticated user information from JWT token
+    This endpoint allows the frontend to verify authentication and get user_id
+    """
+    return {
+        "status": "success",
+        "user_id": str(auth["user_id"]),
+        "client_id": auth.get("client_id"),
+        "email": auth.get("email"),
+        "authenticated": True
+    }
+
 @app.get("/api-key-health")
 async def get_api_key_health():
     """Get detailed API key health information"""
@@ -9526,9 +9680,16 @@ async def health_check():
     }
 
 @app.post("/risk-audit/{user_id}")
-async def process_risk_audit(user_id: str, request: RiskAssessmentRequest):
+async def process_risk_audit(user_id: str, request: RiskAssessmentRequest, auth: Dict = Depends(verify_jwt_token)):
     """Process comprehensive risk audit with multi-database intelligence and indexer integration"""
-    
+
+    # Permission check: user can only access their own data
+    if int(user_id) != auth["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only access your own audit data"
+        )
+
     start_time = time.time()
     logging.info(f"🚀 Starting Risk Audit for user_id={user_id}")
     
@@ -9719,9 +9880,11 @@ async def process_risk_audit(user_id: str, request: RiskAssessmentRequest):
         raise HTTPException(status_code=500, detail=error_message)
 
 @app.get("/risk_report_status/{report_id}")
-async def get_risk_report_status(report_id: str):
+async def get_risk_report_status(report_id: str, auth: Dict = Depends(verify_jwt_token)):
     """Get risk report generation status"""
-    
+
+    # No permission check - report_id doesn't directly contain user_id
+
     if report_id not in risk_job_status:
         # Try to get status from database
         conn = None
@@ -9759,9 +9922,16 @@ async def get_risk_report_status(report_id: str):
     return risk_job_status[report_id]
 
 @app.post("/risk_assessment_progress")
-async def save_risk_progress(request: RiskProgressRequest):
+async def save_risk_progress(request: RiskProgressRequest, auth: Dict = Depends(verify_jwt_token)):
     """Save risk assessment progress with enhanced tracking"""
-    
+
+    # Permission check: user can only save their own progress
+    if int(request.user_id) != auth["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only save your own progress"
+        )
+
     try:
         logging.info(f"💾 Saving risk progress for user {request.user_id}")
         logging.info(f"📊 Progress details: chapter {request.current_chapter}, auto_save: {request.auto_save}")
@@ -9848,9 +10018,16 @@ async def save_risk_progress(request: RiskProgressRequest):
         raise HTTPException(status_code=500, detail=error_message)
 
 @app.get("/risk_assessment_progress/{user_id}")
-async def get_risk_progress(user_id: str):
+async def get_risk_progress(user_id: str, auth: Dict = Depends(verify_jwt_token)):
     """Get saved risk assessment progress for a user"""
-    
+
+    # Permission check: user can only access their own progress
+    if int(user_id) != auth["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only access your own progress"
+        )
+
     conn = None
     try:
         logging.info(f"📥 Retrieving risk progress for user {user_id}")
@@ -9934,9 +10111,16 @@ async def get_risk_progress(user_id: str):
             conn.close()
 
 @app.get("/risk_reports/{user_id}")
-async def get_user_risk_reports(user_id: str):
+async def get_user_risk_reports(user_id: str, auth: Dict = Depends(verify_jwt_token)):
     """Get all risk reports for a user"""
-    
+
+    # Permission check: user can only access their own reports
+    if int(user_id) != auth["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only access your own reports"
+        )
+
     conn = None
     try:
         conn = get_risk_connection()
@@ -9981,9 +10165,11 @@ async def get_user_risk_reports(user_id: str):
             conn.close()
 
 @app.get("/check_risk_indexer/{report_id}")
-async def check_risk_indexer(report_id: str):
+async def check_risk_indexer(report_id: str, auth: Dict = Depends(verify_jwt_token)):
     """Enhanced check if indexer completed for risk reports - now checks both database AND real API status"""
-    
+
+    # No permission check - report_id doesn't directly contain user_id
+
     conn = None
     try:
         conn = get_risk_connection()
